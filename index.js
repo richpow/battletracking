@@ -131,7 +131,6 @@ async function startTracking(creator) {
 
   const conn = new TikTokLiveConnection(creator.username);
   let activeBattleId = null;
-
   const seenGiftKeys = new Set();
 
   conn.on(WebcastEvent.BATTLE_START, async e => {
@@ -262,6 +261,10 @@ async function stopTracking(creatorId) {
 
 async function poll() {
   const creators = await getCreators();
+
+  console.log(
+    `[TRACKING] eligible creators: ${creators.length} | active connections: ${activeConnections.size}`
+  );
 
   for (const creator of creators) {
     const live = await isLive(creator.username);
