@@ -1,4 +1,4 @@
-import { TikTokLiveConnection, WebcastEvent } from "tiktok-live-connector";
+import { TikTokLiveConnection, WebcastEvent, ControlEvent } from "tiktok-live-connector";
 import pkg from "pg";
 
 const { Pool } = pkg;
@@ -12,21 +12,40 @@ const pool = new Pool({
 
 /* ================= CONFIG ================= */
 
-const POLL_INTERVAL_SECONDS = 60;
-const CONNECT_COOLDOWN_MS = 5 * 60 * 1000;
-const CONNECT_STAGGER_MS = 4000;
+const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 60);
+const CONNECT_COOLDOWN_MS = Number(process.env.CONNECT_COOLDOWN_MS || 5 * 60 * 1000);
+const CONNECT_STAGGER_MS = Number(process.env.CONNECT_STAGGER_MS || 4000);
+
+const DIAG_BATTLE_LOGS = String(process.env.DIAG_BATTLE_LOGS || "0") === "1";
 
 /* ================= STATE ================= */
 
-const activeConnections = new Map();
-const failedConnections = new Map();
-const liveSessionLock = new Set();
+const activeConnections = new Map(); // creator_id -> { conn, state }
+const failedConnections = new Map(); // creator_id -> timestamp ms
+const liveSessionLock = new Set(); // creator_id
 
 let lastStatusLogAt = 0;
+let diagLastLogAt = 0;
 
 /* ================= HELPERS ================= */
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function logStatusOncePerMinute(eligibleCount) {
+  const now = Date.now();
+  if (now - lastStatusLogAt < 60_000) return;
+  lastStatusLogAt = now;
+  console.log(`[TRACKING] eligible ${eligibleCount} active ${activeConnections.size}`);
+}
+
+function diagLog(message) {
+  if (!DIAG_BATTLE_LOGS) return;
+
+  const now = Date.now();
+  if (now - diagLastLogAt < 15_000) return;
+  diagLastLogAt = now;
+  console.log(message);
+}
 
 async function getCreators() {
   const { rows } = await pool.query(`
@@ -42,7 +61,7 @@ async function getCreators() {
   }));
 }
 
-/* ================= BATTLE HELPERS ================= */
+/* ================= DB HELPERS ================= */
 
 async function getOpenBattle(creatorId) {
   const { rows } = await pool.query(
@@ -56,11 +75,10 @@ async function getOpenBattle(creatorId) {
     `,
     [creatorId]
   );
-
   return rows[0]?.id || null;
 }
 
-async function createBattle(creator, opponent, battleRef) {
+async function createBattle(creator, opponentUsername, battleRef) {
   const { rows } = await pool.query(
     `
     insert into tiktok_live_battles (
@@ -78,19 +96,18 @@ async function createBattle(creator, opponent, battleRef) {
     [
       creator.creator_id,
       creator.username,
-      opponent,
+      opponentUsername || null,
       battleRef || null
     ]
   );
-
   return rows[0].id;
 }
 
-async function ensureBattle(creator, opponent, battleRef) {
+async function ensureBattle(creator, opponentUsername, battleRef) {
   let battleId = await getOpenBattle(creator.creator_id);
 
   if (battleId) {
-    if (opponent) {
+    if (opponentUsername) {
       await pool.query(
         `
         update tiktok_live_battles
@@ -98,15 +115,92 @@ async function ensureBattle(creator, opponent, battleRef) {
         where id = $2
           and opponent_username is null
         `,
-        [opponent, battleId]
+        [opponentUsername, battleId]
       );
     }
     return battleId;
   }
 
-  if (!opponent) return null;
+  if (!opponentUsername) return null;
+  return createBattle(creator, opponentUsername, battleRef);
+}
 
-  return createBattle(creator, opponent, battleRef);
+async function endBattleIfOpen(activeBattleId, winner, creatorScore, opponentScore) {
+  if (!activeBattleId) return;
+
+  await pool.query(
+    `
+    update tiktok_live_battles
+    set ended_at = now(),
+        creator_score = $1,
+        opponent_score = $2,
+        winner = $3
+    where id = $4
+    `,
+    [Number(creatorScore || 0), Number(opponentScore || 0), winner, activeBattleId]
+  );
+}
+
+/* ================= BATTLE PARSING ================= */
+
+/**
+ * LINK_MIC_BATTLE provides participants.
+ * Schema: WebcastLinkMicBattle { battleUsers: [{ battleGroup: { user } }] }  [oai_citation:2‡jsDelivr](https://cdn.jsdelivr.net/npm/%40adamjessop/tiktok-live-connector%402.0.1/dist/types/tiktok-schema.d.ts)
+ */
+function extractOpponentFromLinkMicBattle(creatorUsername, e) {
+  const users =
+    e?.battleUsers
+      ?.map(x => x?.battleGroup?.user)
+      ?.filter(Boolean)
+      ?.map(u => String(u.uniqueId || "").replace(/^@/, "").trim())
+      ?.filter(Boolean) || [];
+
+  const creator = String(creatorUsername).replace(/^@/, "").trim().toLowerCase();
+  const opponent = users.find(u => u.toLowerCase() !== creator);
+
+  return opponent || null;
+}
+
+/**
+ * LINK_MIC_ARMIES provides points.
+ * Schema: WebcastLinkMicArmies { battleItems: [{ battleGroups: [{ users, points }] }] }  [oai_citation:3‡jsDelivr](https://cdn.jsdelivr.net/npm/%40adamjessop/tiktok-live-connector%402.0.1/dist/types/tiktok-schema.d.ts)
+ */
+function extractScoresFromArmies(creatorUsername, e) {
+  const creator = String(creatorUsername).replace(/^@/, "").trim().toLowerCase();
+
+  const item = e?.battleItems?.[0];
+  const groups = item?.battleGroups || [];
+  if (!Array.isArray(groups) || groups.length < 2) return null;
+
+  const normalizedGroups = groups.map(g => {
+    const users = Array.isArray(g?.users) ? g.users : [];
+    const usernames = users
+      .map(u => String(u?.uniqueId || "").replace(/^@/, "").trim())
+      .filter(Boolean);
+
+    return {
+      usernames,
+      points: Number(g?.points || 0)
+    };
+  });
+
+  const creatorGroup = normalizedGroups.find(g =>
+    g.usernames.some(u => u.toLowerCase() === creator)
+  );
+  if (!creatorGroup) return null;
+
+  const opponentGroup = normalizedGroups.find(g =>
+    !g.usernames.some(u => u.toLowerCase() === creator)
+  );
+  if (!opponentGroup) return null;
+
+  const opponentUsername = opponentGroup.usernames[0] || null;
+
+  return {
+    creatorScore: creatorGroup.points,
+    opponentScore: opponentGroup.points,
+    opponentUsername
+  };
 }
 
 /* ================= TRACKING ================= */
@@ -125,55 +219,72 @@ async function startTracking(creator) {
     fetchRoomInfoOnConnect: true
   });
 
-  let activeBattleId = null;
-  const seenGiftKeys = new Set();
+  const state = {
+    activeBattleId: null,
+    activeOpponent: null,
+    seenGiftKeys: new Set(),
+    lastCreatorScore: 0,
+    lastOpponentScore: 0
+  };
 
-  conn.on(WebcastEvent.BATTLE_START, async e => {
-    activeBattleId = await ensureBattle(
-      creator,
-      e?.opponent?.username,
-      e?.battleId
-    );
+  // Participants event (battle detected)
+  conn.on(WebcastEvent.LINK_MIC_BATTLE, async e => {
+    const opponent = extractOpponentFromLinkMicBattle(creator.username, e);
+    if (!opponent) return;
+
+    state.activeOpponent = opponent;
+    state.activeBattleId = await ensureBattle(creator, opponent, null);
+
+    diagLog(`[DIAG] linkMicBattle for ${creator.username} vs ${opponent}`);
   });
 
-  conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
-    activeBattleId = await ensureBattle(
-      creator,
-      e?.opponent?.username,
-      e?.battleId
-    );
+  // Points event (battle updates)
+  conn.on(WebcastEvent.LINK_MIC_ARMIES, async e => {
+    const scores = extractScoresFromArmies(creator.username, e);
+    if (!scores) return;
 
-    if (!activeBattleId) return;
+    // Ensure we have a battle row as soon as we see score packets
+    state.activeOpponent = state.activeOpponent || scores.opponentUsername || null;
+    state.activeBattleId = await ensureBattle(creator, state.activeOpponent, null);
+    if (!state.activeBattleId) return;
+
+    state.lastCreatorScore = scores.creatorScore;
+    state.lastOpponentScore = scores.opponentScore;
 
     await pool.query(
       `
       update tiktok_live_battles
       set creator_score = $1,
-          opponent_score = $2
-      where id = $3
+          opponent_score = $2,
+          opponent_username = coalesce(opponent_username, $3)
+      where id = $4
       `,
       [
-        Number(e?.score || 0),
-        Number(e?.opponentScore || 0),
-        activeBattleId
+        Number(scores.creatorScore || 0),
+        Number(scores.opponentScore || 0),
+        scores.opponentUsername,
+        state.activeBattleId
       ]
     );
+
+    diagLog(`[DIAG] linkMicArmies for ${creator.username}`);
   });
 
+  // Gifts only during an active battle
   conn.on(WebcastEvent.GIFT, async g => {
-    if (!activeBattleId) return;
+    if (!state.activeBattleId) return;
 
     const dedupeKey = [
       g?.user?.uniqueId,
-      g?.gift?.id,
+      g?.giftId,
       g?.repeatCount,
-      Math.floor((g?.timestamp || Date.now()) / 1000)
+      Math.floor(Number(g?.giftExtra?.timestamp || Date.now()) / 1000)
     ].join(":");
 
-    if (seenGiftKeys.has(dedupeKey)) return;
-    seenGiftKeys.add(dedupeKey);
+    if (state.seenGiftKeys.has(dedupeKey)) return;
+    state.seenGiftKeys.add(dedupeKey);
 
-    const diamondValue = Number(g?.gift?.diamondCount || 0);
+    const diamondValue = Number(g?.giftDetails?.diamondCount || 0);
     const quantity = Number(g?.repeatCount || 1);
 
     await pool.query(
@@ -191,10 +302,10 @@ async function startTracking(creator) {
       values ($1,$2,$3,$4,$5,$6,$7,now())
       `,
       [
-        activeBattleId,
-        g?.user?.uniqueId || "unknown",
-        g?.gift?.name || "unknown",
-        g?.gift?.id || null,
+        state.activeBattleId,
+        String(g?.user?.uniqueId || "unknown").replace(/^@/, ""),
+        g?.giftDetails?.giftName || "unknown",
+        g?.giftId || null,
         diamondValue,
         quantity,
         diamondValue * quantity
@@ -202,38 +313,59 @@ async function startTracking(creator) {
     );
   });
 
-  conn.on(WebcastEvent.BATTLE_END, async e => {
-    if (!activeBattleId) return;
+  // Stream end, close open battle
+  conn.on(WebcastEvent.STREAM_END, async () => {
+    if (state.activeBattleId) {
+      const winner =
+        state.lastCreatorScore > state.lastOpponentScore
+          ? "creator"
+          : state.lastCreatorScore < state.lastOpponentScore
+          ? "opponent"
+          : "draw";
 
-    const creatorScore = Number(e?.score || 0);
-    const opponentScore = Number(e?.opponentScore || 0);
+      await endBattleIfOpen(
+        state.activeBattleId,
+        winner,
+        state.lastCreatorScore,
+        state.lastOpponentScore
+      );
 
-    const winner =
-      creatorScore > opponentScore
-        ? "creator"
-        : creatorScore < opponentScore
-        ? "opponent"
-        : "draw";
+      state.activeBattleId = null;
+      state.activeOpponent = null;
+      state.seenGiftKeys.clear();
+    }
 
-    await pool.query(
-      `
-      update tiktok_live_battles
-      set ended_at = now(),
-          creator_score = $1,
-          opponent_score = $2,
-          winner = $3
-      where id = $4
-      `,
-      [creatorScore, opponentScore, winner, activeBattleId]
-    );
+    await stopTracking(creator.creator_id);
+  });
 
-    activeBattleId = null;
-    seenGiftKeys.clear();
+  // Disconnect, close open battle defensively
+  conn.on(ControlEvent.DISCONNECTED, async () => {
+    if (state.activeBattleId) {
+      const winner =
+        state.lastCreatorScore > state.lastOpponentScore
+          ? "creator"
+          : state.lastCreatorScore < state.lastOpponentScore
+          ? "opponent"
+          : "draw";
+
+      await endBattleIfOpen(
+        state.activeBattleId,
+        winner,
+        state.lastCreatorScore,
+        state.lastOpponentScore
+      );
+
+      state.activeBattleId = null;
+      state.activeOpponent = null;
+      state.seenGiftKeys.clear();
+    }
+
+    await stopTracking(creator.creator_id);
   });
 
   try {
     await conn.connect();
-    activeConnections.set(creator.creator_id, conn);
+    activeConnections.set(creator.creator_id, { conn, state });
     failedConnections.delete(creator.creator_id);
   } catch {
     failedConnections.set(creator.creator_id, Date.now());
@@ -243,28 +375,28 @@ async function startTracking(creator) {
 }
 
 async function stopTracking(creatorId) {
-  const conn = activeConnections.get(creatorId);
-  if (!conn) return;
+  const entry = activeConnections.get(creatorId);
+  if (!entry) return;
 
   try {
-    await conn.disconnect();
+    await entry.conn.disconnect();
   } catch {}
 
   activeConnections.delete(creatorId);
+  liveSessionLock.delete(creatorId);
 }
 
 /* ================= LOOP ================= */
 
 async function poll() {
-  const creators = await getCreators();
-
-  const now = Date.now();
-  if (now - lastStatusLogAt > 60_000) {
-    console.log(
-      `[TRACKING] eligible ${creators.length} active ${activeConnections.size}`
-    );
-    lastStatusLogAt = now;
+  let creators;
+  try {
+    creators = await getCreators();
+  } catch {
+    return;
   }
+
+  logStatusOncePerMinute(creators.length);
 
   for (const creator of creators) {
     await startTracking(creator);
