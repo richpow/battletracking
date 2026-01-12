@@ -1,0 +1,13 @@
+{
+  "name": "battletracking",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@adamjessop/tiktok-live-connector": "^1.5.0",
+    "pg": "^8.11.3"
+  }
+}
