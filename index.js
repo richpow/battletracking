@@ -40,19 +40,6 @@ async function getCreators() {
   }));
 }
 
-async function isLive(username) {
-  const conn = new TikTokLiveConnection(username, {
-    processInitialData: false,
-    fetchRoomInfoOnConnect: false
-  });
-
-  try {
-    return Boolean(await conn.fetchIsLive());
-  } catch {
-    return false;
-  }
-}
-
 /* ================= BATTLE HELPERS ================= */
 
 async function getOpenBattle(creatorId) {
@@ -238,6 +225,7 @@ async function startTracking(creator) {
     await conn.connect();
     activeConnections.set(creator.creator_id, conn);
     failedConnections.delete(creator.creator_id);
+    console.log(`[CONNECT] ${creator.username}`);
   } catch {
     failedConnections.set(creator.creator_id, Date.now());
   } finally {
@@ -254,7 +242,6 @@ async function stopTracking(creatorId) {
   } catch {}
 
   activeConnections.delete(creatorId);
-  liveSessionLock.delete(creatorId);
 }
 
 /* ================= LOOP ================= */
@@ -267,14 +254,8 @@ async function poll() {
   );
 
   for (const creator of creators) {
-    const live = await isLive(creator.username);
-
-    if (live) {
-      await startTracking(creator);
-      await sleep(CONNECT_STAGGER_MS);
-    } else {
-      await stopTracking(creator.creator_id);
-    }
+    await startTracking(creator);
+    await sleep(CONNECT_STAGGER_MS);
   }
 }
 
