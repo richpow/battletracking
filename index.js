@@ -53,7 +53,32 @@ async function isLive(username) {
   }
 }
 
-/* ================= TRACKING ================= */
+/* ================= CORE TRACKING ================= */
+
+async function createBattleIfMissing(creator, opponent, battleRef) {
+  const { rows } = await pool.query(
+    `
+    insert into battles (
+      creator_id,
+      creator_username,
+      opponent_username,
+      tiktok_battle_id,
+      started_at,
+      creator_score,
+      opponent_score
+    ) values ($1,$2,$3,$4,now(),0,0)
+    returning id
+    `,
+    [
+      creator.creator_id,
+      creator.username,
+      opponent || "unknown",
+      battleRef || null
+    ]
+  );
+
+  return rows[0].id;
+}
 
 async function startTracking(creator) {
   if (activeConnections.has(creator.creator_id)) return;
@@ -64,43 +89,29 @@ async function startTracking(creator) {
 
   liveSessionLock.add(creator.creator_id);
 
-  console.log(`[TRACKING START] ${creator.username}`);
-
   const conn = new TikTokLiveConnection(creator.username);
   let activeBattleId = null;
 
+  /* ===== BATTLE START (if emitted) ===== */
   conn.on(WebcastEvent.BATTLE_START, async e => {
-    try {
-      const { rows } = await pool.query(
-        `
-        insert into battles (
-          creator_id,
-          creator_username,
-          opponent_username,
-          tiktok_battle_id,
-          started_at,
-          creator_score,
-          opponent_score
-        ) values ($1,$2,$3,$4,now(),0,0)
-        returning id
-        `,
-        [
-          creator.creator_id,
-          creator.username,
-          e?.opponent?.username || "unknown",
-          e?.battleId || null
-        ]
-      );
+    if (activeBattleId) return;
 
-      activeBattleId = rows[0].id;
-      console.log(`[BATTLE START] ${creator.username}`);
-    } catch (err) {
-      console.error("Battle start error", err);
-    }
+    activeBattleId = await createBattleIfMissing(
+      creator,
+      e?.opponent?.username,
+      e?.battleId
+    );
   });
 
+  /* ===== BATTLE UPDATE (PRIMARY TRIGGER) ===== */
   conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
-    if (!activeBattleId) return;
+    if (!activeBattleId) {
+      activeBattleId = await createBattleIfMissing(
+        creator,
+        e?.opponent?.username,
+        e?.battleId
+      );
+    }
 
     await pool.query(
       `
@@ -109,10 +120,15 @@ async function startTracking(creator) {
           opponent_score = $2
       where id = $3
       `,
-      [Number(e?.score || 0), Number(e?.opponentScore || 0), activeBattleId]
+      [
+        Number(e?.score || 0),
+        Number(e?.opponentScore || 0),
+        activeBattleId
+      ]
     );
   });
 
+  /* ===== BATTLE END ===== */
   conn.on(WebcastEvent.BATTLE_END, async e => {
     if (!activeBattleId) return;
 
@@ -139,9 +155,9 @@ async function startTracking(creator) {
     );
 
     activeBattleId = null;
-    console.log(`[BATTLE END] ${creator.username}`);
   });
 
+  /* ===== GIFTS (ATTACHED TO ACTIVE BATTLE) ===== */
   conn.on(WebcastEvent.GIFT, async g => {
     if (!activeBattleId) return;
 
@@ -178,7 +194,6 @@ async function startTracking(creator) {
     activeConnections.set(creator.creator_id, conn);
     failedConnections.delete(creator.creator_id);
   } catch (err) {
-    console.error(`Connection failed for ${creator.username}`, err);
     failedConnections.set(creator.creator_id, Date.now());
   } finally {
     liveSessionLock.delete(creator.creator_id);
