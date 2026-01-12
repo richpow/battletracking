@@ -22,6 +22,8 @@ const activeConnections = new Map();
 const failedConnections = new Map();
 const liveSessionLock = new Set();
 
+let lastPollLogAt = 0;
+
 /* ================= HELPERS ================= */
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -229,7 +231,6 @@ async function startTracking(creator) {
     await conn.connect();
     activeConnections.set(creator.creator_id, conn);
     failedConnections.delete(creator.creator_id);
-    console.log(`[CONNECT] ${creator.username}`);
   } catch {
     failedConnections.set(creator.creator_id, Date.now());
   } finally {
@@ -253,9 +254,13 @@ async function stopTracking(creatorId) {
 async function poll() {
   const creators = await getCreators();
 
-  console.log(
-    `[TRACKING] eligible creators: ${creators.length} | active connections: ${activeConnections.size}`
-  );
+  const now = Date.now();
+  if (now - lastPollLogAt > 60_000) {
+    console.log(
+      `[TRACKING] eligible creators ${creators.length} active connections ${activeConnections.size}`
+    );
+    lastPollLogAt = now;
+  }
 
   for (const creator of creators) {
     await startTracking(creator);
