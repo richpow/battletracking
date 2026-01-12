@@ -53,12 +53,26 @@ async function isLive(username) {
   }
 }
 
-/* ================= CORE TRACKING ================= */
+/* ================= CORE ================= */
 
 async function createBattleIfMissing(creator, opponent, battleRef) {
+  const existing = await pool.query(
+    `
+    select id
+    from tiktok_live_battles
+    where creator_id = $1
+      and ended_at is null
+    order by started_at desc
+    limit 1
+    `,
+    [creator.creator_id]
+  );
+
+  if (existing.rows.length) return existing.rows[0].id;
+
   const { rows } = await pool.query(
     `
-    insert into battles (
+    insert into tiktok_live_battles (
       creator_id,
       creator_username,
       opponent_username,
@@ -66,13 +80,14 @@ async function createBattleIfMissing(creator, opponent, battleRef) {
       started_at,
       creator_score,
       opponent_score
-    ) values ($1,$2,$3,$4,now(),0,0)
+    )
+    values ($1,$2,$3,$4,now(),0,0)
     returning id
     `,
     [
       creator.creator_id,
       creator.username,
-      opponent || "unknown",
+      opponent || null,
       battleRef || null
     ]
   );
@@ -92,18 +107,16 @@ async function startTracking(creator) {
   const conn = new TikTokLiveConnection(creator.username);
   let activeBattleId = null;
 
-  /* ===== BATTLE START (if emitted) ===== */
   conn.on(WebcastEvent.BATTLE_START, async e => {
-    if (activeBattleId) return;
-
-    activeBattleId = await createBattleIfMissing(
-      creator,
-      e?.opponent?.username,
-      e?.battleId
-    );
+    if (!activeBattleId) {
+      activeBattleId = await createBattleIfMissing(
+        creator,
+        e?.opponent?.username,
+        e?.battleId
+      );
+    }
   });
 
-  /* ===== BATTLE UPDATE (PRIMARY TRIGGER) ===== */
   conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
     if (!activeBattleId) {
       activeBattleId = await createBattleIfMissing(
@@ -115,7 +128,7 @@ async function startTracking(creator) {
 
     await pool.query(
       `
-      update battles
+      update tiktok_live_battles
       set creator_score = $1,
           opponent_score = $2
       where id = $3
@@ -128,7 +141,45 @@ async function startTracking(creator) {
     );
   });
 
-  /* ===== BATTLE END ===== */
+  conn.on(WebcastEvent.GIFT, async g => {
+    if (!activeBattleId) {
+      activeBattleId = await createBattleIfMissing(
+        creator,
+        null,
+        null
+      );
+      if (!activeBattleId) return;
+    }
+
+    const diamondValue = Number(g?.gift?.diamondCount || 0);
+    const quantity = Number(g?.repeatCount || 1);
+
+    await pool.query(
+      `
+      insert into tiktok_battle_gifts (
+        battle_id,
+        gifter_username,
+        gift_name,
+        gift_id,
+        diamond_value,
+        quantity,
+        total_diamonds,
+        gifted_at
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,now())
+      `,
+      [
+        activeBattleId,
+        g?.user?.uniqueId || "unknown",
+        g?.gift?.name || "unknown",
+        g?.gift?.id || null,
+        diamondValue,
+        quantity,
+        diamondValue * quantity
+      ]
+    );
+  });
+
   conn.on(WebcastEvent.BATTLE_END, async e => {
     if (!activeBattleId) return;
 
@@ -144,7 +195,7 @@ async function startTracking(creator) {
 
     await pool.query(
       `
-      update battles
+      update tiktok_live_battles
       set ended_at = now(),
           creator_score = $1,
           opponent_score = $2,
@@ -157,43 +208,11 @@ async function startTracking(creator) {
     activeBattleId = null;
   });
 
-  /* ===== GIFTS (ATTACHED TO ACTIVE BATTLE) ===== */
-  conn.on(WebcastEvent.GIFT, async g => {
-    if (!activeBattleId) return;
-
-    const diamondValue = Number(g?.gift?.diamondCount || 0);
-    const quantity = Number(g?.repeatCount || 1);
-
-    await pool.query(
-      `
-      insert into battle_gifts (
-        battle_id,
-        gifter_username,
-        gift_name,
-        gift_id,
-        diamond_value,
-        quantity,
-        total_diamonds,
-        gifted_at
-      ) values ($1,$2,$3,$4,$5,$6,$7,now())
-      `,
-      [
-        activeBattleId,
-        g?.user?.uniqueId || "unknown",
-        g?.gift?.name || "unknown",
-        g?.gift?.id || null,
-        diamondValue,
-        quantity,
-        diamondValue * quantity
-      ]
-    );
-  });
-
   try {
     await conn.connect();
     activeConnections.set(creator.creator_id, conn);
     failedConnections.delete(creator.creator_id);
-  } catch (err) {
+  } catch {
     failedConnections.set(creator.creator_id, Date.now());
   } finally {
     liveSessionLock.delete(creator.creator_id);
@@ -212,7 +231,7 @@ async function stopTracking(creatorId) {
   liveSessionLock.delete(creatorId);
 }
 
-/* ================= MAIN LOOP ================= */
+/* ================= LOOP ================= */
 
 async function poll() {
   const creators = await getCreators();
