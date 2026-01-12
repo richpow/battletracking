@@ -3,31 +3,32 @@ import pkg from "pg";
 
 const { Pool } = pkg;
 
-/* =======================
-   DATABASE
-======================= */
+/* ================= DATABASE ================= */
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-/* =======================
-   CONFIG
-======================= */
+/* ================= CONFIG ================= */
 
 const POLL_INTERVAL_SECONDS = 60;
-const activeConnections = new Map();
+const CONNECT_COOLDOWN_MS = 5 * 60 * 1000;
+const CONNECT_STAGGER_MS = 4000;
 
-/* =======================
-   HELPERS
-======================= */
+/* ================= STATE ================= */
+
+const activeConnections = new Map();
+const failedConnections = new Map();
+const liveSessionLock = new Set();
+
+/* ================= HELPERS ================= */
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function getCreators() {
   const { rows } = await pool.query(`
-    select distinct
-      creator_id,
-      tiktok_username
+    select distinct creator_id, tiktok_username
     from users
     where tiktok_username is not null
       and tiktok_username <> ''
@@ -52,12 +53,16 @@ async function isLive(username) {
   }
 }
 
-/* =======================
-   TRACKING
-======================= */
+/* ================= TRACKING ================= */
 
 async function startTracking(creator) {
   if (activeConnections.has(creator.creator_id)) return;
+  if (liveSessionLock.has(creator.creator_id)) return;
+
+  const lastFailed = failedConnections.get(creator.creator_id);
+  if (lastFailed && Date.now() - lastFailed < CONNECT_COOLDOWN_MS) return;
+
+  liveSessionLock.add(creator.creator_id);
 
   console.log(`[TRACKING START] ${creator.username}`);
 
@@ -97,98 +102,86 @@ async function startTracking(creator) {
   conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
     if (!activeBattleId) return;
 
-    try {
-      await pool.query(
-        `
-        update battles
-        set creator_score = $1,
-            opponent_score = $2
-        where id = $3
-        `,
-        [
-          Number(e?.score || 0),
-          Number(e?.opponentScore || 0),
-          activeBattleId
-        ]
-      );
-    } catch (err) {
-      console.error("Battle update error", err);
-    }
+    await pool.query(
+      `
+      update battles
+      set creator_score = $1,
+          opponent_score = $2
+      where id = $3
+      `,
+      [Number(e?.score || 0), Number(e?.opponentScore || 0), activeBattleId]
+    );
   });
 
   conn.on(WebcastEvent.BATTLE_END, async e => {
     if (!activeBattleId) return;
 
-    try {
-      const creatorScore = Number(e?.score || 0);
-      const opponentScore = Number(e?.opponentScore || 0);
+    const creatorScore = Number(e?.score || 0);
+    const opponentScore = Number(e?.opponentScore || 0);
 
-      const winner =
-        creatorScore > opponentScore
-          ? "creator"
-          : creatorScore < opponentScore
-          ? "opponent"
-          : "draw";
+    const winner =
+      creatorScore > opponentScore
+        ? "creator"
+        : creatorScore < opponentScore
+        ? "opponent"
+        : "draw";
 
-      await pool.query(
-        `
-        update battles
-        set ended_at = now(),
-            creator_score = $1,
-            opponent_score = $2,
-            winner = $3
-        where id = $4
-        `,
-        [creatorScore, opponentScore, winner, activeBattleId]
-      );
+    await pool.query(
+      `
+      update battles
+      set ended_at = now(),
+          creator_score = $1,
+          opponent_score = $2,
+          winner = $3
+      where id = $4
+      `,
+      [creatorScore, opponentScore, winner, activeBattleId]
+    );
 
-      console.log(`[BATTLE END] ${creator.username}`);
-      activeBattleId = null;
-    } catch (err) {
-      console.error("Battle end error", err);
-    }
+    activeBattleId = null;
+    console.log(`[BATTLE END] ${creator.username}`);
   });
 
   conn.on(WebcastEvent.GIFT, async g => {
     if (!activeBattleId) return;
 
-    try {
-      const diamondValue = Number(g?.gift?.diamondCount || 0);
-      const quantity = Number(g?.repeatCount || 1);
+    const diamondValue = Number(g?.gift?.diamondCount || 0);
+    const quantity = Number(g?.repeatCount || 1);
 
-      await pool.query(
-        `
-        insert into battle_gifts (
-          battle_id,
-          gifter_username,
-          gift_name,
-          gift_id,
-          diamond_value,
-          quantity,
-          total_diamonds,
-          gifted_at
-        ) values ($1,$2,$3,$4,$5,$6,$7,now())
-        `,
-        [
-          activeBattleId,
-          g?.user?.uniqueId || "unknown",
-          g?.gift?.name || "unknown",
-          g?.gift?.id || null,
-          diamondValue,
-          quantity,
-          diamondValue * quantity
-        ]
-      );
-    } catch (err) {
-      console.error("Gift insert error", err);
-    }
+    await pool.query(
+      `
+      insert into battle_gifts (
+        battle_id,
+        gifter_username,
+        gift_name,
+        gift_id,
+        diamond_value,
+        quantity,
+        total_diamonds,
+        gifted_at
+      ) values ($1,$2,$3,$4,$5,$6,$7,now())
+      `,
+      [
+        activeBattleId,
+        g?.user?.uniqueId || "unknown",
+        g?.gift?.name || "unknown",
+        g?.gift?.id || null,
+        diamondValue,
+        quantity,
+        diamondValue * quantity
+      ]
+    );
   });
 
   try {
     await conn.connect();
     activeConnections.set(creator.creator_id, conn);
+    failedConnections.delete(creator.creator_id);
   } catch (err) {
     console.error(`Connection failed for ${creator.username}`, err);
+    failedConnections.set(creator.creator_id, Date.now());
+  } finally {
+    liveSessionLock.delete(creator.creator_id);
   }
 }
 
@@ -201,27 +194,20 @@ async function stopTracking(creatorId) {
   } catch {}
 
   activeConnections.delete(creatorId);
+  liveSessionLock.delete(creatorId);
 }
 
-/* =======================
-   MAIN LOOP
-======================= */
+/* ================= MAIN LOOP ================= */
 
 async function poll() {
-  let creators = [];
-
-  try {
-    creators = await getCreators();
-  } catch (err) {
-    console.error("Failed to load creators", err);
-    return;
-  }
+  const creators = await getCreators();
 
   for (const creator of creators) {
     const live = await isLive(creator.username);
 
     if (live) {
       await startTracking(creator);
+      await sleep(CONNECT_STAGGER_MS);
     } else {
       await stopTracking(creator.creator_id);
     }
