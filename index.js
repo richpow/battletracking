@@ -53,10 +53,10 @@ async function isLive(username) {
   }
 }
 
-/* ================= CORE ================= */
+/* ================= BATTLE HELPERS ================= */
 
-async function createBattleIfMissing(creator, opponent, battleRef) {
-  const existing = await pool.query(
+async function getOpenBattle(creatorId) {
+  const { rows } = await pool.query(
     `
     select id
     from tiktok_live_battles
@@ -65,11 +65,13 @@ async function createBattleIfMissing(creator, opponent, battleRef) {
     order by started_at desc
     limit 1
     `,
-    [creator.creator_id]
+    [creatorId]
   );
 
-  if (existing.rows.length) return existing.rows[0].id;
+  return rows[0]?.id || null;
+}
 
+async function createBattle(creator, opponent, battleRef) {
   const { rows } = await pool.query(
     `
     insert into tiktok_live_battles (
@@ -95,6 +97,28 @@ async function createBattleIfMissing(creator, opponent, battleRef) {
   return rows[0].id;
 }
 
+async function ensureBattle(creator, opponent, battleRef) {
+  let battleId = await getOpenBattle(creator.creator_id);
+  if (battleId) {
+    if (opponent) {
+      await pool.query(
+        `
+        update tiktok_live_battles
+        set opponent_username = $1
+        where id = $2
+          and opponent_username is null
+        `,
+        [opponent, battleId]
+      );
+    }
+    return battleId;
+  }
+
+  return createBattle(creator, opponent, battleRef);
+}
+
+/* ================= TRACKING ================= */
+
 async function startTracking(creator) {
   if (activeConnections.has(creator.creator_id)) return;
   if (liveSessionLock.has(creator.creator_id)) return;
@@ -109,7 +133,7 @@ async function startTracking(creator) {
 
   conn.on(WebcastEvent.BATTLE_START, async e => {
     if (!activeBattleId) {
-      activeBattleId = await createBattleIfMissing(
+      activeBattleId = await ensureBattle(
         creator,
         e?.opponent?.username,
         e?.battleId
@@ -118,13 +142,11 @@ async function startTracking(creator) {
   });
 
   conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
-    if (!activeBattleId) {
-      activeBattleId = await createBattleIfMissing(
-        creator,
-        e?.opponent?.username,
-        e?.battleId
-      );
-    }
+    activeBattleId = await ensureBattle(
+      creator,
+      e?.opponent?.username,
+      e?.battleId
+    );
 
     await pool.query(
       `
@@ -142,14 +164,7 @@ async function startTracking(creator) {
   });
 
   conn.on(WebcastEvent.GIFT, async g => {
-    if (!activeBattleId) {
-      activeBattleId = await createBattleIfMissing(
-        creator,
-        null,
-        null
-      );
-      if (!activeBattleId) return;
-    }
+    activeBattleId = await ensureBattle(creator, null, null);
 
     const diamondValue = Number(g?.gift?.diamondCount || 0);
     const quantity = Number(g?.repeatCount || 1);
