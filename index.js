@@ -99,6 +99,7 @@ async function createBattle(creator, opponent, battleRef) {
 
 async function ensureBattle(creator, opponent, battleRef) {
   let battleId = await getOpenBattle(creator.creator_id);
+
   if (battleId) {
     if (opponent) {
       await pool.query(
@@ -131,14 +132,14 @@ async function startTracking(creator) {
   const conn = new TikTokLiveConnection(creator.username);
   let activeBattleId = null;
 
+  const seenGiftKeys = new Set();
+
   conn.on(WebcastEvent.BATTLE_START, async e => {
-    if (!activeBattleId) {
-      activeBattleId = await ensureBattle(
-        creator,
-        e?.opponent?.username,
-        e?.battleId
-      );
-    }
+    activeBattleId = await ensureBattle(
+      creator,
+      e?.opponent?.username,
+      e?.battleId
+    );
   });
 
   conn.on(WebcastEvent.BATTLE_UPDATE, async e => {
@@ -165,6 +166,16 @@ async function startTracking(creator) {
 
   conn.on(WebcastEvent.GIFT, async g => {
     activeBattleId = await ensureBattle(creator, null, null);
+
+    const dedupeKey = [
+      g?.user?.uniqueId,
+      g?.gift?.id,
+      g?.repeatCount,
+      Math.floor((g?.timestamp || Date.now()) / 1000)
+    ].join(":");
+
+    if (seenGiftKeys.has(dedupeKey)) return;
+    seenGiftKeys.add(dedupeKey);
 
     const diamondValue = Number(g?.gift?.diamondCount || 0);
     const quantity = Number(g?.repeatCount || 1);
@@ -221,6 +232,7 @@ async function startTracking(creator) {
     );
 
     activeBattleId = null;
+    seenGiftKeys.clear();
   });
 
   try {
