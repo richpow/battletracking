@@ -22,7 +22,7 @@ const activeConnections = new Map();
 const failedConnections = new Map();
 const liveSessionLock = new Set();
 
-let lastPollLogAt = 0;
+let lastStatusLogAt = 0;
 
 /* ================= HELPERS ================= */
 
@@ -120,7 +120,11 @@ async function startTracking(creator) {
 
   liveSessionLock.add(creator.creator_id);
 
-  const conn = new TikTokLiveConnection(creator.username);
+  const conn = new TikTokLiveConnection(creator.username, {
+    processInitialData: true,
+    fetchRoomInfoOnConnect: true
+  });
+
   let activeBattleId = null;
   const seenGiftKeys = new Set();
 
@@ -255,11 +259,11 @@ async function poll() {
   const creators = await getCreators();
 
   const now = Date.now();
-  if (now - lastPollLogAt > 60_000) {
+  if (now - lastStatusLogAt > 60_000) {
     console.log(
-      `[TRACKING] eligible creators ${creators.length} active connections ${activeConnections.size}`
+      `[TRACKING] eligible ${creators.length} active ${activeConnections.size}`
     );
-    lastPollLogAt = now;
+    lastStatusLogAt = now;
   }
 
   for (const creator of creators) {
