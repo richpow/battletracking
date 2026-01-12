@@ -76,7 +76,7 @@ async function createBattle(creator, opponent, battleRef) {
     [
       creator.creator_id,
       creator.username,
-      opponent || null,
+      opponent,
       battleRef || null
     ]
   );
@@ -101,6 +101,8 @@ async function ensureBattle(creator, opponent, battleRef) {
     }
     return battleId;
   }
+
+  if (!opponent) return null;
 
   return createBattle(creator, opponent, battleRef);
 }
@@ -135,6 +137,8 @@ async function startTracking(creator) {
       e?.battleId
     );
 
+    if (!activeBattleId) return;
+
     await pool.query(
       `
       update tiktok_live_battles
@@ -151,7 +155,7 @@ async function startTracking(creator) {
   });
 
   conn.on(WebcastEvent.GIFT, async g => {
-    activeBattleId = await ensureBattle(creator, null, null);
+    if (!activeBattleId) return;
 
     const dedupeKey = [
       g?.user?.uniqueId,
